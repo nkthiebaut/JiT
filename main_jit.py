@@ -11,7 +11,8 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-from util.crop import center_crop_arr
+import wandb
+
 import util.misc as misc
 
 import copy
@@ -78,7 +79,7 @@ def get_args_parser():
                         help='CFG interval max')
     parser.add_argument('--num_images', default=50000, type=int,
                         help='Number of images to generate')
-    parser.add_argument('--eval_freq', type=int, default=40,
+    parser.add_argument('--eval_freq', type=int, default=1,
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
@@ -100,6 +101,16 @@ def get_args_parser():
     parser.add_argument('--log_freq', default=100, type=int)
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
+    
+    # wandb logging
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable wandb logging')
+    parser.add_argument('--wandb_project', default='JiT-training', type=str,
+                        help='wandb project name')
+    parser.add_argument('--wandb_entity', default=None, type=str,
+                        help='wandb entity (username or team name)')
+    parser.add_argument('--wandb_run_name', default=None, type=str,
+                        help='wandb run name (defaults to output_dir basename)')
 
     # distributed training
     parser.add_argument('--world_size', default=1, type=int,
@@ -128,18 +139,23 @@ def main(args):
 
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
-
-    # Set up TensorBoard logging (only on main process)
-    if global_rank == 0 and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.output_dir)
-    else:
-        log_writer = None
+    
+    # Set up wandb logging (only on main process)
+    if global_rank == 0 and args.wandb:
+        wandb_run_name = args.wandb_run_name if args.wandb_run_name else os.path.basename(args.output_dir)
+        wandb.init( 
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=wandb_run_name,
+            config=vars(args),
+            resume='allow',
+            id=wandb_run_name  # Use consistent ID for resuming
+        )
 
     # Data augmentation transforms
     transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
+        # transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
+        # transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])
 
@@ -158,11 +174,17 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True
     )
-
+    data_loader_val = torch.utils.data.DataLoader(
+        datasets.ImageFolder(os.path.join(args.data_path, 'valid'), transform=transform_train),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True
+    )   
+    
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 
-    # Create denoiser
     model = Denoiser(args)
 
     print("Model =", model)
@@ -215,7 +237,7 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=None)
         return
 
     # Training loop
@@ -225,7 +247,7 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        train_one_epoch(model, model_without_ddp, data_loader_train, data_loader_val, optimizer, device, epoch, log_writer=None, args=args)
 
         # Save checkpoint periodically
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
@@ -249,11 +271,11 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=None)
             torch.cuda.empty_cache()
 
-        if misc.is_main_process() and log_writer is not None:
-            log_writer.flush()
+        # if misc.is_main_process() and log_writer is not None:
+        #     log_writer.flush()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

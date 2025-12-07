@@ -11,9 +11,11 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch_fidelity
 import copy
+import wandb
 
 
-def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+
+def train_one_epoch(model, model_without_ddp, data_loader, validation_data_loader, optimizer, device, epoch, log_writer=None, args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -56,13 +58,33 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
-        if log_writer is not None:
-            # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+        if wandb.run is not None:
+            wandb.log({
+                'train/loss': loss_value_reduce,
+                'train/lr': lr,
+                'train/epoch': epoch + data_iter_step / len(data_loader)
+            })
 
+
+    # Compute validation loss
+    if validation_data_loader:
+        with torch.inference_mode():
+            loss_value_reduce = 0
+            for i, (x, labels) in enumerate(data_loader):
+                # normalize image to [-1, 1]
+                x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
+                x = x * 2.0 - 1.0
+                labels = labels.to(device, non_blocking=True)
+
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    loss = model(x, labels)
+                loss_value = loss.item()
+                loss_value_reduce += misc.all_reduce_mean(loss_value)
+            if wandb.run is not None:
+                wandb.log({
+                    'val/loss': loss_value_reduce / len(data_loader),
+                })
+                
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
@@ -95,9 +117,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
-    assert args.num_images % class_num == 0, "Number of images per class must be the same"
     class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
-    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
+    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(args.num_images)])
 
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
@@ -131,31 +152,20 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     print("Switch back from ema")
     model_without_ddp.load_state_dict(model_state_dict)
 
-    # compute FID and IS
-    if log_writer is not None:
-        if args.img_size == 256:
-            fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
-        elif args.img_size == 512:
-            fid_statistics_file = 'fid_stats/jit_in512_stats.npz'
-        else:
-            raise NotImplementedError
-        metrics_dict = torch_fidelity.calculate_metrics(
-            input1=save_folder,
-            input2=None,
-            fid_statistics_file=fid_statistics_file,
-            cuda=True,
-            isc=True,
-            fid=True,
-            kid=False,
-            prc=False,
-            verbose=False,
-        )
-        fid = metrics_dict['frechet_inception_distance']
-        inception_score = metrics_dict['inception_score_mean']
-        postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
-        print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        shutil.rmtree(save_folder)
+    # Log sample images to wandb (only on main process)
+    if wandb.run is not None and misc.get_rank() == 0:
+        # Log a grid of sample images (e.g., first 16 images)
+        num_samples = min(16, args.num_images)
+        sample_images = []
+        for img_id in range(num_samples):
+            img_path = os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5)))
+            if os.path.exists(img_path):
+                sample_images.append(wandb.Image(img_path, caption=f"Sample {img_id}"))
+        
+        if sample_images:
+            wandb.log({
+                f'eval/generated_samples_cfg{model_without_ddp.cfg_scale}_res{args.img_size}': sample_images,
+                'eval/epoch': epoch
+            })
 
     torch.distributed.barrier()
